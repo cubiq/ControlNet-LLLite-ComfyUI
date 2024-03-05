@@ -34,11 +34,7 @@ def extra_options_to_module_prefix(extra_options):
     return module_pfx
 
 
-def load_control_net_lllite_patch(path, cond_image, multiplier, num_steps, start_percent, end_percent):
-    # calculate start and end step
-    start_step = math.floor(num_steps * start_percent * 0.01) if start_percent > 0 else 0
-    end_step = math.floor(num_steps * end_percent * 0.01) if end_percent > 0 else num_steps
-
+def load_control_net_lllite_patch(path, cond_image, multiplier, sigma_start, sigma_end):
     # load weights
     ctrl_sd = comfy.utils.load_torch_file(path, safe_load=True)
 
@@ -72,9 +68,6 @@ def load_control_net_lllite_patch(path, cond_image, multiplier, num_steps, start
             cond_emb_dim=weights["conditioning1.0.weight"].shape[0] * 2,
             mlp_dim=weights["down.0.weight"].shape[0],
             multiplier=multiplier,
-            num_steps=num_steps,
-            start_step=start_step,
-            end_step=end_step,
         )
         info = module.load_state_dict(weights)
         modules[module_name] = module
@@ -96,6 +89,8 @@ def load_control_net_lllite_patch(path, cond_image, multiplier, num_steps, start
 
         def __call__(self, q, k, v, extra_options):
             module_pfx = extra_options_to_module_prefix(extra_options)
+            temp_sigma = extra_options["sigmas"] if 'sigmas' in extra_options else None # this mess is needed for DirectML
+            sigma = temp_sigma[0].item() if temp_sigma else 999999999.9
 
             is_attn1 = q.shape[-1] == k.shape[-1]  # self attention
             if is_attn1:
@@ -107,12 +102,13 @@ def load_control_net_lllite_patch(path, cond_image, multiplier, num_steps, start
             module_pfx_to_k = module_pfx + "_to_k"
             module_pfx_to_v = module_pfx + "_to_v"
 
-            if module_pfx_to_q in self.modules:
-                q = q + self.modules[module_pfx_to_q](q)
-            if module_pfx_to_k in self.modules:
-                k = k + self.modules[module_pfx_to_k](k)
-            if module_pfx_to_v in self.modules:
-                v = v + self.modules[module_pfx_to_v](v)
+            if sigma <= sigma_start and sigma >= sigma_end:
+                if module_pfx_to_q in self.modules:
+                    q = q + self.modules[module_pfx_to_q](q)
+                if module_pfx_to_k in self.modules:
+                    k = k + self.modules[module_pfx_to_k](k)
+                if module_pfx_to_v in self.modules:
+                    v = v + self.modules[module_pfx_to_v](v)
 
             return q, k, v
 
@@ -134,17 +130,11 @@ class LLLiteModule(torch.nn.Module):
         cond_emb_dim: int,
         mlp_dim: int,
         multiplier: int,
-        num_steps: int,
-        start_step: int,
-        end_step: int,
     ):
         super().__init__()
         self.name = name
         self.is_conv2d = is_conv2d
         self.multiplier = multiplier
-        self.num_steps = num_steps
-        self.start_step = start_step
-        self.end_step = end_step
         self.is_first = False
 
         modules = []
@@ -192,34 +182,14 @@ class LLLiteModule(torch.nn.Module):
         self.depth = depth
         self.cond_image = None
         self.cond_emb = None
-        self.current_step = 0
 
     # @torch.inference_mode()
     def set_cond_image(self, cond_image):
         # print("set_cond_image", self.name)
         self.cond_image = cond_image
         self.cond_emb = None
-        self.current_step = 0
 
     def forward(self, x):
-        if self.num_steps > 0:
-            if self.current_step < self.start_step:
-                self.current_step += 1
-                return torch.zeros_like(x)
-            elif self.current_step >= self.end_step:
-                if self.is_first and self.current_step == self.end_step:
-                    print(f"end LLLite: step {self.current_step}")
-                self.current_step += 1
-                if self.current_step >= self.num_steps:
-                    self.current_step = 0  # reset
-                return torch.zeros_like(x)
-            else:
-                if self.is_first and self.current_step == self.start_step:
-                    print(f"start LLLite: step {self.current_step}")
-                self.current_step += 1
-                if self.current_step >= self.num_steps:
-                    self.current_step = 0  # reset
-
         if self.cond_emb is None:
             # print(f"cond_emb is None, {self.name}")
             cx = self.conditioning1(self.cond_image.to(x.device, dtype=x.dtype))
@@ -258,9 +228,8 @@ class LLLiteLoader:
                 "model_name": (get_file_list(os.path.join(CURRENT_DIR, "models")),),
                 "cond_image": ("IMAGE",),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
-                "steps": ("INT", {"default": 0, "min": 0, "max": 200, "step": 1}),
-                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1}),
-                "end_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.001}),
             }
         }
 
@@ -268,13 +237,17 @@ class LLLiteLoader:
     FUNCTION = "load_lllite"
     CATEGORY = "loaders"
 
-    def load_lllite(self, model, model_name, cond_image, strength, steps, start_percent, end_percent):
+    def load_lllite(self, model, model_name, cond_image, strength, start_percent, end_percent):
         # cond_image is b,h,w,3, 0-1
 
         model_path = os.path.join(CURRENT_DIR, os.path.join(CURRENT_DIR, "models", model_name))
 
         model_lllite = model.clone()
-        patch = load_control_net_lllite_patch(model_path, cond_image, strength, steps, start_percent, end_percent)
+
+        sigma_start = model_lllite.model.model_sampling.percent_to_sigma(start_percent)
+        sigma_end = model_lllite.model.model_sampling.percent_to_sigma(end_percent)
+
+        patch = load_control_net_lllite_patch(model_path, cond_image, strength, sigma_start, sigma_end)
         if patch is not None:
             model_lllite.set_model_attn1_patch(patch)
             model_lllite.set_model_attn2_patch(patch)
