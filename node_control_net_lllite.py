@@ -89,8 +89,7 @@ def load_control_net_lllite_patch(path, cond_image, multiplier, sigma_start, sig
 
         def __call__(self, q, k, v, extra_options):
             module_pfx = extra_options_to_module_prefix(extra_options)
-            temp_sigma = extra_options["sigmas"] if 'sigmas' in extra_options else None # this mess is needed for DirectML
-            sigma = temp_sigma[0].item() if temp_sigma is not None else 999999999.9
+            sigma = extra_options["sigmas"].detach().cpu()[0].item() if 'sigmas' in extra_options else 999999999.9
 
             is_attn1 = q.shape[-1] == k.shape[-1]  # self attention
             if is_attn1:
